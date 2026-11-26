@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 
 from .core import InFlightDeduplicator, PolicyExecutor, ThreadTypeRegistry, TTLCache
-from .errors import AuthenticationError, NotFoundError, ValidationError
+from .errors import AuthenticationError, NotFoundError, ValidationError, ZapindError
 from .mappers import (
     map_account_settings,
     map_group_kwargs,
@@ -497,23 +498,64 @@ class ConversationsService:
         tid, ttype = await _resolve_thread_target(self._deps, cid, thread_type)
         return Conversation(tid, ttype, self._deps.actions)
 
-    async def get_messages(self, conversation_id: str, count: int | None = None) -> MessagePage:
+    async def get_messages(
+        self,
+        conversation_id: str,
+        count: int | None = None,
+        *,
+        cursor: str | None = None,
+        is_old: bool = False,
+    ) -> MessagePage:
         _ensure_connected(self._deps.transport)
         cid = _require_non_empty(conversation_id, "conversation_id")
         _assert_optional_positive_int(count, "count")
-        res = await self._deps.executor.execute(
-            lambda: self._deps.transport.get_group_chat_history(cid, count),
-            operation="conversations.get_messages",
-            idempotent=True,
+
+        fn = self._deps.transport.get_group_chat_history
+        sig = inspect.signature(fn)
+        accepts_pagination = "cursor" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
         )
+
+        async def _call() -> dict[str, object]:
+            if accepts_pagination:
+                return await fn(cid, count, cursor=cursor, is_old=is_old)
+            return await fn(cid, count)
+
+        try:
+            res = await self._deps.executor.execute(
+                _call,
+                operation="conversations.get_messages",
+                idempotent=True,
+            )
+        except ZapindError as err:
+            if err.raw_code == -69 or "-69" in err.message:
+                return MessagePage(items=[], has_more=False, next_cursor=None, is_old=is_old)
+            raise
+
+        raw_messages = res.get("messages") if isinstance(res, dict) else []
         items = [
             Message(actions=self._deps.actions, **map_message_kwargs(raw))
-            for raw in (res.get("messages") or [])
+            for raw in (raw_messages if isinstance(raw_messages, list) else [])
+            if isinstance(raw, dict)
         ]
+        if count is not None and len(items) > count:
+            items = items[:count]
+        next_cursor_val = res.get("nextCursor") if isinstance(res, dict) else None
         return MessagePage(
             items=items,
-            has_more=bool(res.get("hasMore")),
-            next_cursor=res.get("nextCursor"),
+            has_more=bool(res.get("hasMore")) if isinstance(res, dict) else False,
+            next_cursor=str(next_cursor_val) if next_cursor_val is not None else None,
+            is_old=bool(res.get("isOld", is_old)) if isinstance(res, dict) else is_old,
+        )
+
+    async def request_old_messages(
+        self, thread_type: ThreadType, last_msg_id: str | None = None
+    ) -> None:
+        _ensure_connected(self._deps.transport)
+        await self._deps.executor.execute(
+            lambda: self._deps.transport.request_old_messages(thread_type, last_msg_id),
+            operation="conversations.request_old_messages",
+            idempotent=True,
         )
 
     async def get_pinned(self) -> PinnedConversations:

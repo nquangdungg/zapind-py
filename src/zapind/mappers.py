@@ -6,18 +6,27 @@ from typing import Any
 from .models import (
     AccountSettings,
     Attachment,
+    ConnectionEvent,
     Gender,
     GroupMember,
     GroupSettings,
     GroupSummary,
     GroupType,
+    GroupUpdateEvent,
     LastOnlineInfo,
     Mention,
     MessageQuote,
     MessageSenderRef,
     OnlineStatus,
+    ReactionEvent,
+    SeenEvent,
     ThreadType,
+    TypingEvent,
+    UndoEvent,
+    UnreadMark,
+    UnreadMarks,
     UploadedMedia,
+    UserUpdateEvent,
 )
 
 
@@ -195,8 +204,10 @@ def map_message_kwargs(raw: dict[str, Any]) -> dict[str, Any]:
     reply_to: MessageQuote | None = None
     raw_quote = data.get("quote")
     if isinstance(raw_quote, dict):
+        sender_name_raw = raw_quote.get("fromD") or raw_quote.get("senderName")
         reply_to = MessageQuote(
             owner_id=str(raw_quote.get("ownerId") or ""),
+            sender_name=str(sender_name_raw) if sender_name_raw else None,
             client_msg_id=str(raw_quote.get("cliMsgId") or ""),
             global_msg_id=str(raw_quote.get("globalMsgId") or ""),
             text=str(raw_quote.get("msg") or ""),
@@ -204,7 +215,13 @@ def map_message_kwargs(raw: dict[str, Any]) -> dict[str, Any]:
         )
 
     raw_type = raw.get("type")
-    thread_type = ThreadType.GROUP if raw_type == ThreadType.GROUP else ThreadType.USER
+    if raw_type is None:
+        raw_type = raw.get("threadType")
+    thread_type = (
+        ThreadType.GROUP
+        if raw_type in (ThreadType.GROUP, 1, "1") or raw.get("isGroup") is True
+        else ThreadType.USER
+    )
 
     return {
         "id": str(data.get("msgId") or ""),
@@ -282,4 +299,181 @@ def map_account_settings(raw: dict[str, Any]) -> AccountSettings:
         add_friend_via_qr=raw.get("add_friend_via_qr") == 1,
         accept_stranger_call=raw.get("accept_stranger_call") == 1,
         two_factor_enabled=raw.get("setting_2FA_status") == 1,
+    )
+
+
+def _parse_thread_type(raw_val: Any, *, is_group: bool = False) -> ThreadType:
+    if is_group or raw_val in (ThreadType.GROUP, 1, "1"):
+        return ThreadType.GROUP
+    return ThreadType.USER
+
+
+def map_unread_marks(raw: dict[str, Any] | None) -> UnreadMarks:
+    if not isinstance(raw, dict):
+        return UnreadMarks(groups=[], users=[])
+
+    def _map_list(entries: Any, default_type: ThreadType) -> list[UnreadMark]:
+        if not isinstance(entries, list):
+            return []
+        out: list[UnreadMark] = []
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            out.append(
+                UnreadMark(
+                    thread_id=str(item.get("threadId") or item.get("id") or ""),
+                    thread_type=_parse_thread_type(
+                        item.get("threadType", item.get("type", default_type)),
+                        is_group=default_type == ThreadType.GROUP,
+                    ),
+                    client_msg_id=str(item.get("clientMsgId") or item.get("cliMsgId") or ""),
+                    sender_id=str(item.get("senderId") or item.get("fromUid") or ""),
+                    timestamp=_to_datetime(item.get("timestamp") or item.get("ts")),
+                )
+            )
+        return out
+
+    return UnreadMarks(
+        groups=_map_list(raw.get("groups") or raw.get("convsGroup"), ThreadType.GROUP),
+        users=_map_list(raw.get("users") or raw.get("convsUser"), ThreadType.USER),
+    )
+
+
+def map_connection_event(raw: Any) -> ConnectionEvent:
+    if isinstance(raw, ConnectionEvent):
+        return raw
+    d = raw if isinstance(raw, dict) else {}
+    code_raw = d.get("code")
+    code = int(code_raw) if isinstance(code_raw, int) and not isinstance(code_raw, bool) else None
+    reason = str(d["reason"]) if d.get("reason") is not None else None
+    return ConnectionEvent(connected=bool(d.get("connected")), code=code, reason=reason)
+
+
+def map_reaction_event(raw: Any) -> ReactionEvent:
+    if isinstance(raw, ReactionEvent):
+        return raw
+    d = raw if isinstance(raw, dict) else {}
+    inner = d.get("data") if isinstance(d.get("data"), dict) else d
+    content = inner.get("content") if isinstance(inner.get("content"), dict) else {}
+    raw_targets = d.get("targetMessageIds") or d.get("target_message_ids")
+    if isinstance(raw_targets, list):
+        targets = [str(x) for x in raw_targets if x]
+    else:
+        r_msg = content.get("rMsg") or []
+        targets = [str(x.get("gMsgID") or "") for x in r_msg if isinstance(x, dict) and x.get("gMsgID")]
+    return ReactionEvent(
+        thread_id=str(d.get("threadId") or d.get("thread_id") or ""),
+        thread_type=_parse_thread_type(
+            d.get("threadType", d.get("thread_type")),
+            is_group=bool(d.get("isGroup")),
+        ),
+        sender_id=str(d.get("senderId") or d.get("sender_id") or inner.get("uidFrom") or ""),
+        icon=str(d.get("icon") or content.get("rIcon") or ""),
+        target_message_ids=targets,
+        is_self=bool(d.get("isSelf") if "isSelf" in d else d.get("is_self")),
+        timestamp=_to_datetime(d.get("timestamp") or inner.get("ts")),
+    )
+
+
+def map_typing_event(raw: Any) -> TypingEvent:
+    if isinstance(raw, TypingEvent):
+        return raw
+    d = raw if isinstance(raw, dict) else {}
+    inner = d.get("data") if isinstance(d.get("data"), dict) else d
+    return TypingEvent(
+        thread_id=str(d.get("threadId") or d.get("thread_id") or ""),
+        thread_type=_parse_thread_type(
+            d.get("threadType", d.get("thread_type")),
+            is_group=bool(d.get("isGroup")),
+        ),
+        user_id=str(d.get("userId") or d.get("user_id") or inner.get("uid") or ""),
+        is_self=bool(d.get("isSelf") if "isSelf" in d else d.get("is_self")),
+    )
+
+
+def map_seen_event(raw: Any) -> SeenEvent:
+    if isinstance(raw, SeenEvent):
+        return raw
+    d = raw if isinstance(raw, dict) else {}
+    inner = d.get("data") if isinstance(d.get("data"), dict) else d
+    raw_ids = d.get("messageIds") or d.get("message_ids")
+    if isinstance(raw_ids, list):
+        message_ids = [str(x) for x in raw_ids if x]
+    else:
+        candidates = [
+            inner.get("realMsgId"),
+            inner.get("msgId"),
+            inner.get("idMsg"),
+        ]
+        message_ids = [str(c) for c in candidates if c]
+    raw_seen = d.get("seenBy") or d.get("seen_by") or inner.get("seenUids") or []
+    seen_by = [str(u) for u in raw_seen if u] if isinstance(raw_seen, list) else []
+    return SeenEvent(
+        thread_id=str(d.get("threadId") or d.get("thread_id") or inner.get("idTo") or ""),
+        thread_type=_parse_thread_type(
+            d.get("threadType", d.get("thread_type")),
+            is_group=bool(d.get("isGroup")),
+        ),
+        message_ids=message_ids,
+        seen_by=seen_by,
+    )
+
+
+def map_undo_event(raw: Any) -> UndoEvent:
+    if isinstance(raw, UndoEvent):
+        return raw
+    d = raw if isinstance(raw, dict) else {}
+    inner = d.get("data") if isinstance(d.get("data"), dict) else d
+    content = inner.get("content") if isinstance(inner.get("content"), dict) else {}
+    return UndoEvent(
+        thread_id=str(d.get("threadId") or d.get("thread_id") or ""),
+        thread_type=_parse_thread_type(
+            d.get("threadType", d.get("thread_type")),
+            is_group=bool(d.get("isGroup")),
+        ),
+        sender_id=str(d.get("senderId") or d.get("sender_id") or inner.get("uidFrom") or ""),
+        message_id=str(
+            d.get("messageId")
+            or d.get("message_id")
+            or content.get("globalMsgId")
+            or inner.get("msgId")
+            or ""
+        ),
+        client_msg_id=str(
+            d.get("clientMsgId")
+            or d.get("client_msg_id")
+            or content.get("cliMsgId")
+            or inner.get("cliMsgId")
+            or ""
+        ),
+        is_self=bool(d.get("isSelf") if "isSelf" in d else d.get("is_self")),
+    )
+
+
+def map_group_update_event(raw: Any) -> GroupUpdateEvent:
+    if isinstance(raw, GroupUpdateEvent):
+        return raw
+    d = raw if isinstance(raw, dict) else {}
+    data_obj = d.get("data") if isinstance(d.get("data"), dict) else {}
+    raw_targets = d.get("targetIds") or d.get("target_ids") or []
+    target_ids = [str(x) for x in raw_targets if x] if isinstance(raw_targets, list) else []
+    actor = d.get("actorId") or d.get("actor_id") or data_obj.get("sourceId")
+    return GroupUpdateEvent(
+        group_id=str(d.get("groupId") or d.get("group_id") or d.get("threadId") or ""),
+        type=str(d.get("type") or "unknown"),
+        actor_id=str(actor) if actor else None,
+        target_ids=target_ids,
+        data=data_obj,
+    )
+
+
+def map_user_update_event(raw: Any) -> UserUpdateEvent:
+    if isinstance(raw, UserUpdateEvent):
+        return raw
+    d = raw if isinstance(raw, dict) else {}
+    data_obj = d.get("data") if isinstance(d.get("data"), dict) else {}
+    return UserUpdateEvent(
+        user_id=str(d.get("userId") or d.get("user_id") or d.get("threadId") or ""),
+        type=str(d.get("type") or "unknown"),
+        data=data_obj,
     )

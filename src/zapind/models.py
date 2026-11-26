@@ -5,6 +5,8 @@ from datetime import datetime
 from enum import Enum, IntEnum
 from typing import Any, Awaitable, Callable, Protocol, Union
 
+from .errors import ValidationError
+
 
 class ThreadType(IntEnum):
     USER = 0
@@ -165,6 +167,7 @@ class MessageQuote:
     global_msg_id: str
     text: str
     timestamp: datetime
+    sender_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -204,6 +207,7 @@ class MessagePage:
     items: list[Message]
     has_more: bool
     next_cursor: str | None = None
+    is_old: bool = False
 
 
 @dataclass(frozen=True)
@@ -348,6 +352,12 @@ class AuthRequiredEvent:
     error: Exception | None = None
 
 
+@dataclass(frozen=True)
+class OldMessagesEvent:
+    messages: list[Message]
+    thread_type: ThreadType
+
+
 class ModelActions(Protocol):
     async def send_message(
         self, target_id: str, content: SendMessageContent, thread_type: ThreadType
@@ -359,7 +369,14 @@ class ModelActions(Protocol):
     async def undo_message(self, message: Message) -> None: ...
     async def delete_message(self, message: Message, only_me: bool = True) -> None: ...
     async def mark_seen(self, messages: list[Message]) -> None: ...
-    async def get_group_messages(self, group_id: str, count: int | None = None) -> MessagePage: ...
+    async def get_group_messages(
+        self,
+        group_id: str,
+        count: int | None = None,
+        *,
+        cursor: str | None = None,
+        is_old: bool = False,
+    ) -> MessagePage: ...
     async def send_typing(self, thread_id: str, thread_type: ThreadType) -> None: ...
     async def pin_conversation(
         self, thread_id: str, pinned: bool, thread_type: ThreadType
@@ -499,8 +516,16 @@ class Group:
     async def send(self, content: SendMessageContent) -> SendMessageReceipt:
         return await self._actions.send_message(self.id, content, ThreadType.GROUP)
 
-    async def get_messages(self, count: int | None = None) -> MessagePage:
-        return await self._actions.get_group_messages(self.id, count)
+    async def get_messages(
+        self,
+        count: int | None = None,
+        *,
+        cursor: str | None = None,
+        is_old: bool = False,
+    ) -> MessagePage:
+        return await self._actions.get_group_messages(
+            self.id, count, cursor=cursor, is_old=is_old
+        )
 
     async def add_members(self, user_ids: list[str]) -> None:
         await self._actions.add_group_members(self.id, user_ids)
@@ -530,8 +555,22 @@ class Conversation:
     async def send(self, content: SendMessageContent) -> SendMessageReceipt:
         return await self._actions.send_message(self.id, content, self.thread_type)
 
-    async def get_messages(self, count: int | None = None) -> MessagePage:
-        return await self._actions.get_group_messages(self.id, count)
+    async def get_messages(
+        self,
+        count: int | None = None,
+        *,
+        cursor: str | None = None,
+        is_old: bool = False,
+    ) -> MessagePage:
+        if not self.is_group:
+            raise ValidationError(
+                'Zalo cloud history REST API only supports group conversations. '
+                'For direct messages, listen to the "old_messages" event and call '
+                "await client.conversations.request_old_messages(ThreadType.USER)."
+            )
+        return await self._actions.get_group_messages(
+            self.id, count, cursor=cursor, is_old=is_old
+        )
 
     async def send_typing(self) -> None:
         await self._actions.send_typing(self.id, self.thread_type)

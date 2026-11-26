@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import hashlib
@@ -78,7 +79,7 @@ class FileSessionStore(SessionStore):
             raise SessionError("FileSessionStore requires a non-empty file_path")
         self.file_path = Path(path_str)
 
-    async def load(self) -> StoredSessionRecord | None:
+    def _load_sync(self) -> StoredSessionRecord | None:
         if not self.file_path.exists():
             return None
         try:
@@ -90,7 +91,10 @@ class FileSessionStore(SessionStore):
         except Exception as err:
             raise SessionError(f'Failed to read session file "{self.file_path}"', cause=err) from err
 
-    async def save(self, record: StoredSessionRecord) -> None:
+    async def load(self) -> StoredSessionRecord | None:
+        return await asyncio.to_thread(self._load_sync)
+
+    def _save_sync(self, record: StoredSessionRecord) -> None:
         tmp = self.file_path.with_name(
             f"{self.file_path.name}.tmp.{int(time.time() * 1000)}.{secrets.token_hex(4)}"
         )
@@ -110,11 +114,17 @@ class FileSessionStore(SessionStore):
                 pass
             raise SessionError(f'Failed to save session file "{self.file_path}"', cause=err) from err
 
-    async def clear(self) -> None:
+    async def save(self, record: StoredSessionRecord) -> None:
+        await asyncio.to_thread(self._save_sync, record)
+
+    def _clear_sync(self) -> None:
         try:
             self.file_path.unlink(missing_ok=True)
         except Exception as err:
             raise SessionError(f'Failed to remove session file "{self.file_path}"', cause=err) from err
+
+    async def clear(self) -> None:
+        await asyncio.to_thread(self._clear_sync)
 
 
 class EncryptedFileSessionStore(SessionStore):
@@ -145,7 +155,7 @@ class EncryptedFileSessionStore(SessionStore):
     def _derive_key(self, salt: bytes) -> bytes:
         return hashlib.scrypt(self._secret, salt=salt, n=16384, r=8, p=1, dklen=32)
 
-    async def load(self) -> StoredSessionRecord | None:
+    def _load_sync(self) -> StoredSessionRecord | None:
         if not self.file_path.exists():
             return None
         AESGCM = self._import_aesgcm()
@@ -168,7 +178,10 @@ class EncryptedFileSessionStore(SessionStore):
                 f'Failed to decrypt session file "{self.file_path}"', cause=err
             ) from err
 
-    async def save(self, record: StoredSessionRecord) -> None:
+    async def load(self) -> StoredSessionRecord | None:
+        return await asyncio.to_thread(self._load_sync)
+
+    def _save_sync(self, record: StoredSessionRecord) -> None:
         AESGCM = self._import_aesgcm()
         tmp = self.file_path.with_name(
             f"{self.file_path.name}.tmp.{int(time.time() * 1000)}.{secrets.token_hex(4)}"
@@ -205,10 +218,16 @@ class EncryptedFileSessionStore(SessionStore):
                 f'Failed to save encrypted session "{self.file_path}"', cause=err
             ) from err
 
-    async def clear(self) -> None:
+    async def save(self, record: StoredSessionRecord) -> None:
+        await asyncio.to_thread(self._save_sync, record)
+
+    def _clear_sync(self) -> None:
         try:
             self.file_path.unlink(missing_ok=True)
         except Exception as err:
             raise SessionError(
                 f'Failed to remove encrypted session "{self.file_path}"', cause=err
             ) from err
+
+    async def clear(self) -> None:
+        await asyncio.to_thread(self._clear_sync)

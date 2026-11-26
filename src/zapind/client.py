@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import time
 from datetime import datetime, timezone
@@ -29,6 +31,7 @@ from .models import (
     GroupUpdateEvent,
     Message,
     MessagePage,
+    OldMessagesEvent,
     QRCodeData,
     QRScannedData,
     Reaction,
@@ -91,8 +94,17 @@ class _ClientModelActions:
     async def mark_seen(self, messages: list[Message]) -> None:
         await self._client.messages.mark_seen(messages)
 
-    async def get_group_messages(self, group_id: str, count: int | None = None) -> MessagePage:
-        return await self._client.conversations.get_messages(group_id, count)
+    async def get_group_messages(
+        self,
+        group_id: str,
+        count: int | None = None,
+        *,
+        cursor: str | None = None,
+        is_old: bool = False,
+    ) -> MessagePage:
+        return await self._client.conversations.get_messages(
+            group_id, count, cursor=cursor, is_old=is_old
+        )
 
     async def send_typing(self, thread_id: str, thread_type: ThreadType) -> None:
         await self._client.conversations.send_typing(thread_id, thread_type=thread_type)
@@ -155,6 +167,11 @@ class EventsNamespace:
 
     async def stop(self) -> None:
         await self._client.stop_listening()
+
+    async def request_old_messages(
+        self, thread_type: ThreadType, last_msg_id: str | None = None
+    ) -> None:
+        await self._client.conversations.request_old_messages(thread_type, last_msg_id)
 
 
 class Zapind:
@@ -285,7 +302,11 @@ class Zapind:
         on_declined: Callable[[], Any] | None = None,
         timeout: float | None = None,
         force_qr: bool = False,
+        session_only: bool = False,
     ) -> SessionInfo:
+        if force_qr and session_only:
+            raise ValidationError("force_qr and session_only cannot both be True")
+
         if credentials is not None:
             return await self._auth_with_credentials(credentials)
 
@@ -300,8 +321,18 @@ class Zapind:
                         "auth.required",
                         AuthRequiredEvent(reason="session_expired", error=normalized),
                     )
+                    if session_only:
+                        if isinstance(normalized, SessionError):
+                            raise normalized from err
+                        raise SessionError(
+                            normalized.message,
+                            raw_code=normalized.raw_code,
+                            cause=normalized,
+                        ) from err
             else:
                 self._event_bus.emit("auth.required", AuthRequiredEvent(reason="no_session"))
+                if session_only:
+                    raise SessionError("No saved session found (session_only=True)")
 
         return await self._login_with_qr(
             on_qr_code=on_qr_code,
@@ -384,26 +415,35 @@ class Zapind:
     ) -> SessionInfo:
         self._status = ClientStatus.QR_PENDING
         effective_timeout = timeout if timeout is not None else self._qr_timeout
+        cb_tasks: set[asyncio.Task[Any]] = set()
+
+        def _invoke_cb(cb: Callable[..., Any] | None, *args: Any) -> None:
+            if cb is None:
+                return
+            try:
+                res = cb(*args)
+                if inspect.isawaitable(res):
+                    task = asyncio.create_task(self._run_callback(res))
+                    cb_tasks.add(task)
+                    task.add_done_callback(cb_tasks.discard)
+            except Exception as err:
+                self._logger.error("QR callback threw an error", {"error": str(err)})
 
         def _handle_qr(qr: QRCodeData) -> None:
             self._status = ClientStatus.QR_PENDING
-            if on_qr_code:
-                on_qr_code(qr)
+            _invoke_cb(on_qr_code, qr)
 
         def _handle_scanned(info: QRScannedData) -> None:
             self._status = ClientStatus.SCANNED
-            if on_scanned:
-                on_scanned(info)
+            _invoke_cb(on_scanned, info)
 
         def _handle_expired() -> None:
             self._status = ClientStatus.IDLE
-            if on_expired:
-                on_expired()
+            _invoke_cb(on_expired)
 
         def _handle_declined() -> None:
             self._status = ClientStatus.IDLE
-            if on_declined:
-                on_declined()
+            _invoke_cb(on_declined)
 
         try:
             creds = await self._executor.execute(
@@ -424,6 +464,12 @@ class Zapind:
             self._status = ClientStatus.ERROR
             self._session_info = None
             raise normalize_error(err, "QR login failed") from err
+
+    async def _run_callback(self, awaitable: Any) -> None:
+        try:
+            await awaitable
+        except Exception as err:
+            self._logger.error("Async QR callback failed", {"error": str(err)})
 
     async def logout(self, *, clear_session: bool = True) -> None:
         await self.stop_listening()
@@ -476,6 +522,44 @@ class Zapind:
                 return
             self._event_bus.emit("message", Message(actions=self._actions, **kwargs))
 
+        def _on_old_messages(payload: Any) -> None:
+            if isinstance(payload, OldMessagesEvent):
+                for m in payload.messages:
+                    if m.thread_type == ThreadType.GROUP:
+                        self._registry.register_group(m.thread_id)
+                    else:
+                        self._registry.register_user(m.thread_id)
+                if payload.messages:
+                    self._event_bus.emit("old_messages", payload)
+                return
+
+            if not isinstance(payload, dict):
+                return
+            raw_msgs = payload.get("messages") or []
+            raw_tt = payload.get("threadType", payload.get("thread_type"))
+            thread_type = (
+                ThreadType.GROUP if raw_tt in (ThreadType.GROUP, 1, "1") else ThreadType.USER
+            )
+            mapped: list[Message] = []
+            for item in raw_msgs:
+                if isinstance(item, Message):
+                    msg = item
+                elif isinstance(item, dict):
+                    item_with_type = {**item, "type": item.get("type", thread_type)}
+                    msg = Message(actions=self._actions, **map_message_kwargs(item_with_type))
+                else:
+                    continue
+                if msg.thread_type == ThreadType.GROUP:
+                    self._registry.register_group(msg.thread_id)
+                else:
+                    self._registry.register_user(msg.thread_id)
+                mapped.append(msg)
+            if mapped:
+                self._event_bus.emit(
+                    "old_messages",
+                    OldMessagesEvent(messages=mapped, thread_type=thread_type),
+                )
+
         def _on_reaction(evt: ReactionEvent) -> None:
             if evt.is_self and not self._self_listen:
                 return
@@ -525,21 +609,26 @@ class Zapind:
         def _on_error(err: Any) -> None:
             self._event_bus.emit("error", normalize_error(err, "Realtime listener error"))
 
-        await self._transport.start_listening(
-            {
-                "message": _on_message,
-                "reaction": _on_reaction,
-                "group.update": _on_group_update,
-                "user.update": _on_user_update,
-                "typing": _on_typing,
-                "seen": _on_seen,
-                "undo": _on_undo,
-                "connected": _on_connected,
-                "disconnected": _on_disconnected,
-                "error": _on_error,
-            },
-            retry_on_close=retry_on_close,
-        )
+        try:
+            await self._transport.start_listening(
+                {
+                    "message": _on_message,
+                    "old_messages": _on_old_messages,
+                    "reaction": _on_reaction,
+                    "group.update": _on_group_update,
+                    "user.update": _on_user_update,
+                    "typing": _on_typing,
+                    "seen": _on_seen,
+                    "undo": _on_undo,
+                    "connected": _on_connected,
+                    "disconnected": _on_disconnected,
+                    "error": _on_error,
+                },
+                retry_on_close=retry_on_close,
+            )
+        except BaseException:
+            self._listening = False
+            raise
 
     async def stop_listening(self) -> None:
         if not self._listening:

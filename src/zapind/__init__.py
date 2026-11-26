@@ -36,6 +36,7 @@ from .models import (
     MessageQuote,
     MessageSenderRef,
     MessageStyle,
+    OldMessagesEvent,
     OnlineStatus,
     PinnedConversations,
     Profile,
@@ -70,7 +71,7 @@ from .storage import (
 )
 from .transport import NodeBridgeTransport, TransportAdapter
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 __all__ = [
     "__version__",
@@ -128,6 +129,7 @@ __all__ = [
     "UnreadMarks",
     "ThreadTarget",
     "ConnectionEvent",
+    "OldMessagesEvent",
     "ReactionEvent",
     "TypingEvent",
     "SeenEvent",

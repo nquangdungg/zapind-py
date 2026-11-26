@@ -114,10 +114,13 @@ class InFlightDeduplicator:
 
         task: asyncio.Task[T] = asyncio.create_task(coro_factory())  # type: ignore[arg-type]
         self._pending[key] = task
-        try:
-            return await task
-        finally:
-            self._pending.pop(key, None)
+
+        def _cleanup(_done: asyncio.Task[Any]) -> None:
+            if self._pending.get(key) is task:
+                self._pending.pop(key, None)
+
+        task.add_done_callback(_cleanup)
+        return await asyncio.shield(task)
 
     def clear(self) -> None:
         self._pending.clear()
@@ -335,11 +338,9 @@ class EventBus:
         return lambda: self.off(event, handler)
 
     def once(self, event: str, handler: EventHandler) -> UnsubscribeFn:
-        async def _wrapped(payload: Any) -> None:
+        def _wrapped(payload: Any) -> Any:
             self.off(event, _wrapped)
-            res = handler(payload)
-            if inspect.isawaitable(res):
-                await res
+            return handler(payload)
 
         return self.on(event, _wrapped)
 

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import re
 from typing import Any
+
+_HTTP_STATUS_RE = re.compile(r"(?:status code|http(?:\s+error)?)\s+(\d{3})\b", re.IGNORECASE)
 
 
 class ZapindError(Exception):
@@ -136,6 +139,58 @@ class APIError(ZapindError):
         )
 
 
+def _extract_status(err: Any, message: str) -> int | None:
+    candidates: list[Any] = []
+    if isinstance(err, dict):
+        candidates.extend([err.get("status"), err.get("statusCode"), err.get("status_code")])
+        resp = err.get("response")
+        if isinstance(resp, dict):
+            candidates.extend([resp.get("status"), resp.get("statusCode"), resp.get("status_code")])
+    else:
+        candidates.extend(
+            [
+                getattr(err, "status", None),
+                getattr(err, "status_code", None),
+                getattr(err, "statusCode", None),
+            ]
+        )
+        resp = getattr(err, "response", None)
+        if resp is not None:
+            candidates.extend(
+                [
+                    getattr(resp, "status", None),
+                    getattr(resp, "status_code", None),
+                    getattr(resp, "statusCode", None),
+                ]
+            )
+
+    for candidate in candidates:
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and 100 <= candidate <= 599:
+            return candidate
+
+    match = _HTTP_STATUS_RE.search(message)
+    if match:
+        parsed = int(match.group(1))
+        if 100 <= parsed <= 599:
+            return parsed
+    return None
+
+
+def _extract_raw_code(err: Any) -> int | None:
+    if isinstance(err, dict):
+        for key in ("rawCode", "raw_code", "code"):
+            val = err.get(key)
+            if isinstance(val, int) and not isinstance(val, bool):
+                return val
+        return None
+
+    for attr in ("raw_code", "rawCode", "code"):
+        val = getattr(err, attr, None)
+        if isinstance(val, int) and not isinstance(val, bool):
+            return val
+    return None
+
+
 def normalize_error(
     err: Any,
     fallback_message: str = "Unexpected Zalo API error",
@@ -147,20 +202,23 @@ def normalize_error(
     cause = err if isinstance(err, BaseException) else None
     if isinstance(err, dict):
         message = str(err.get("message") or fallback_message)
-        status = err.get("status")
-        raw_code = err.get("code") if isinstance(err.get("code"), int) else None
         retry_after = err.get("retry_after_ms") or err.get("retryAfterMs")
         err_code = str(err.get("code") or "")
     else:
         message = str(err) if str(err).strip() else fallback_message
-        status = getattr(err, "status", None)
-        raw_code = getattr(err, "raw_code", None)
-        retry_after = getattr(err, "retry_after_ms", None)
+        retry_after = getattr(err, "retry_after_ms", None) or getattr(err, "retryAfterMs", None)
         err_code = str(getattr(err, "code", "") or "")
 
+    status = _extract_status(err, message)
+    raw_code = _extract_raw_code(err)
     lower = message.lower()
 
-    if err_code == "RATE_LIMIT_ERROR" or status == 429 or "rate limit" in lower or "too many requests" in lower:
+    if (
+        err_code == "RATE_LIMIT_ERROR"
+        or status == 429
+        or "rate limit" in lower
+        or "too many requests" in lower
+    ):
         return RateLimitError(
             message,
             retry_after_ms=int(retry_after) if isinstance(retry_after, (int, float)) else None,
@@ -174,7 +232,11 @@ def normalize_error(
         or "unauthorized" in lower
     ):
         return SessionError(message, raw_code=raw_code, cause=cause)
-    if err_code == "AUTHENTICATION_ERROR" or "not authenticated" in lower or "qr" in lower and "declined" in lower:
+    if (
+        err_code == "AUTHENTICATION_ERROR"
+        or "not authenticated" in lower
+        or ("qr" in lower and "declined" in lower)
+    ):
         return AuthenticationError(message, raw_code=raw_code, cause=cause)
     if err_code == "PERMISSION_ERROR" or status == 403 or "forbidden" in lower or "permission" in lower:
         return PermissionError(message, raw_code=raw_code, cause=cause)

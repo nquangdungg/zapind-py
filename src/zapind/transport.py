@@ -1,12 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from abc import ABC, abstractmethod
 from typing import Any, Callable
 
-from .errors import AuthenticationError, NetworkError, normalize_error
+from .errors import AuthenticationError, NetworkError, ValidationError, normalize_error
+from .mappers import (
+    map_connection_event,
+    map_group_update_event,
+    map_reaction_event,
+    map_seen_event,
+    map_typing_event,
+    map_undo_event,
+    map_unread_marks,
+    map_user_update_event,
+)
 from .models import (
+    ConnectionEvent,
+    MediaBuffer,
     MediaInput,
     Message,
     PinnedConversations,
@@ -153,8 +166,18 @@ class TransportAdapter(ABC):
 
     @abstractmethod
     async def get_group_chat_history(
-        self, group_id: str, count: int | None = None
+        self,
+        group_id: str,
+        count: int | None = None,
+        *,
+        cursor: str | None = None,
+        is_old: bool = False,
     ) -> dict[str, Any]: ...
+
+    async def request_old_messages(
+        self, thread_type: ThreadType, last_msg_id: str | None = None
+    ) -> None:
+        raise ValidationError("Current transport does not support request_old_messages")
 
     @abstractmethod
     async def undo_message(self, message: Message) -> None: ...
@@ -188,6 +211,58 @@ class TransportAdapter(ABC):
     async def stop_listening(self) -> None: ...
 
 
+_REALTIME_EVENT_KEYS = (
+    "message",
+    "old_messages",
+    "reaction",
+    "group.update",
+    "user.update",
+    "typing",
+    "seen",
+    "undo",
+    "connected",
+    "disconnected",
+    "error",
+)
+
+
+def _serialize_media_input(item: MediaInput) -> str | dict[str, Any]:
+    if isinstance(item, MediaBuffer):
+        return {
+            "dataBase64": base64.b64encode(item.data).decode("ascii"),
+            "filename": item.filename,
+            "totalSize": item.total_size if item.total_size is not None else len(item.data),
+            "width": item.width,
+            "height": item.height,
+        }
+    return item
+
+
+def _map_bridge_event(event_name: str, data: Any) -> Any:
+    if event_name == "reaction":
+        return map_reaction_event(data)
+    if event_name == "typing":
+        return map_typing_event(data)
+    if event_name == "seen":
+        return map_seen_event(data)
+    if event_name == "undo":
+        return map_undo_event(data)
+    if event_name == "group.update":
+        return map_group_update_event(data)
+    if event_name == "user.update":
+        return map_user_update_event(data)
+    if event_name in ("connected", "disconnected"):
+        return map_connection_event(data)
+    return data
+
+
+def _is_stop_paging_error(err: BaseException) -> bool:
+    raw_code = getattr(err, "raw_code", None)
+    if raw_code == -69:
+        return True
+    return "-69" in str(err)
+
+
 class NodeBridgeTransport(TransportAdapter):
     """
     Stdio JSON-RPC transport that delegates Zalo protocol operations to a Node.js (>= 20)
@@ -204,11 +279,14 @@ class NodeBridgeTransport(TransportAdapter):
         self._worker_script = worker_script
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
+        self._write_lock = asyncio.Lock()
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._next_id = 1
         self._connected = False
         self._own_id = ""
         self._handlers: dict[str, Callable[[Any], Any]] = {}
+        self._disconnecting = False
 
     async def _ensure_process(self) -> asyncio.subprocess.Process:
         if self._proc is not None and self._proc.returncode is None:
@@ -218,6 +296,7 @@ class NodeBridgeTransport(TransportAdapter):
                 "NodeBridgeTransport requires a worker_script (or pass a custom TransportAdapter). "
                 "See Zapind Python documentation for setting up the Node.js bridge worker."
             )
+        self._disconnecting = False
         try:
             self._proc = await asyncio.create_subprocess_exec(
                 self._node,
@@ -227,31 +306,78 @@ class NodeBridgeTransport(TransportAdapter):
                 stderr=asyncio.subprocess.PIPE,
             )
         except OSError as err:
-            raise NetworkError(f"Failed to start Node.js bridge process ({self._node})", cause=err) from err
+            raise NetworkError(
+                f"Failed to start Node.js bridge process ({self._node})", cause=err
+            ) from err
         self._reader_task = asyncio.create_task(self._read_loop())
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
         return self._proc
 
+    async def _drain_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            while True:
+                chunk = await proc.stderr.read(4096)
+                if not chunk:
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    def _fail_all_pending(self, exc: BaseException) -> None:
+        pending = list(self._pending.values())
+        self._pending.clear()
+        for fut in pending:
+            if not fut.done():
+                fut.set_exception(exc)
+
     async def _read_loop(self) -> None:
-        assert self._proc is not None and self._proc.stdout is not None
-        while True:
-            line = await self._proc.stdout.readline()
-            if not line:
-                break
-            try:
-                frame = json.loads(line.decode("utf-8"))
-            except json.JSONDecodeError:
-                continue
-            if "id" in frame and frame["id"] in self._pending:
-                fut = self._pending.pop(frame["id"])
-                if not fut.done():
-                    if "error" in frame and frame["error"] is not None:
-                        fut.set_exception(normalize_error(frame["error"]))
-                    else:
-                        fut.set_result(frame.get("result"))
-            elif "event" in frame:
-                handler = self._handlers.get(str(frame["event"]))
-                if handler:
-                    handler(frame.get("data"))
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    frame = json.loads(line.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(frame, dict):
+                    continue
+                if "id" in frame and frame["id"] in self._pending:
+                    fut = self._pending.pop(frame["id"])
+                    if not fut.done():
+                        if "error" in frame and frame["error"] is not None:
+                            fut.set_exception(normalize_error(frame["error"]))
+                        else:
+                            fut.set_result(frame.get("result"))
+                elif "event" in frame:
+                    event_name = str(frame["event"])
+                    handler = self._handlers.get(event_name)
+                    if handler:
+                        handler(_map_bridge_event(event_name, frame.get("data")))
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if not self._disconnecting:
+                self._connected = False
+                self._fail_all_pending(
+                    NetworkError("Node.js bridge process exited unexpectedly")
+                )
+                disconnect_handler = self._handlers.get("disconnected")
+                if disconnect_handler:
+                    disconnect_handler(
+                        ConnectionEvent(
+                            connected=False,
+                            code=1006,
+                            reason="Node.js bridge process closed",
+                        )
+                    )
 
     async def _rpc(self, method: str, params: dict[str, Any] | None = None) -> Any:
         proc = await self._ensure_process()
@@ -262,9 +388,18 @@ class NodeBridgeTransport(TransportAdapter):
         fut: asyncio.Future[Any] = loop.create_future()
         self._pending[req_id] = fut
         payload = json.dumps({"id": req_id, "method": method, "params": params or {}}) + "\n"
-        proc.stdin.write(payload.encode("utf-8"))
-        await proc.stdin.drain()
-        return await fut
+        try:
+            async with self._write_lock:
+                proc.stdin.write(payload.encode("utf-8"))
+                await proc.stdin.drain()
+        except Exception as err:
+            self._pending.pop(req_id, None)
+            raise NetworkError(f"Failed to send RPC request '{method}' to bridge", cause=err) from err
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            self._pending.pop(req_id, None)
+            raise
 
     def is_connected(self) -> bool:
         return self._connected
@@ -317,7 +452,12 @@ class NodeBridgeTransport(TransportAdapter):
         if on_declined:
             self._handlers["qr_declined"] = lambda _: on_declined()
 
-        res = await self._rpc("loginWithQR", {"userAgent": user_agent, "language": language})
+        try:
+            res = await self._rpc("loginWithQR", {"userAgent": user_agent, "language": language})
+        finally:
+            for key in ("qr_code", "qr_scanned", "qr_expired", "qr_declined"):
+                self._handlers.pop(key, None)
+
         self._connected = True
         self._own_id = str((res or {}).get("ownId") or "")
         creds = (res or {}).get("credentials") or {}
@@ -329,18 +469,27 @@ class NodeBridgeTransport(TransportAdapter):
         )
 
     async def disconnect(self) -> None:
+        self._disconnecting = True
         self._connected = False
         self._own_id = ""
+        self._handlers.clear()
+        self._fail_all_pending(NetworkError("Bridge transport disconnected"))
         if self._proc is not None and self._proc.returncode is None:
             try:
                 self._proc.terminate()
                 await asyncio.wait_for(self._proc.wait(), timeout=3.0)
             except Exception:
                 self._proc.kill()
-        if self._reader_task is not None:
-            self._reader_task.cancel()
+        for task in (self._reader_task, self._stderr_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
         self._proc = None
         self._reader_task = None
+        self._stderr_task = None
 
     async def fetch_account_info(self) -> dict[str, Any] | None:
         return await self._rpc("fetchAccountInfo")
@@ -430,8 +579,8 @@ class NodeBridgeTransport(TransportAdapter):
         )
 
     async def get_unread_marks(self) -> UnreadMarks:
-        await self._rpc("getUnreadMarks")
-        return UnreadMarks(groups=[], users=[])
+        res = await self._rpc("getUnreadMarks")
+        return map_unread_marks(res if isinstance(res, dict) else None)
 
     async def set_pinned_conversations(
         self, ids: list[str], pinned: bool, thread_type: ThreadType
@@ -459,19 +608,48 @@ class NodeBridgeTransport(TransportAdapter):
     async def send_message(
         self, thread_id: str, payload: SendMessagePayload, thread_type: ThreadType
     ) -> SendMessageReceipt:
-        res = await self._rpc(
-            "sendMessage",
-            {
-                "threadId": thread_id,
-                "threadType": int(thread_type),
-                "text": payload.text,
-                "link": payload.link,
-                "sticker": payload.sticker,
-                "voice": payload.voice,
-                "video": payload.video,
-                "ttlMs": payload.ttl_ms,
-            },
-        )
+        rpc_params: dict[str, Any] = {
+            "threadId": thread_id,
+            "threadType": int(thread_type),
+            "text": payload.text,
+            "link": payload.link,
+            "sticker": payload.sticker,
+            "voice": payload.voice,
+            "video": payload.video,
+            "ttlMs": payload.ttl_ms,
+        }
+        if payload.reply_to is not None:
+            rpc_params["replyTo"] = {
+                "id": payload.reply_to.id,
+                "clientMsgId": payload.reply_to.client_msg_id,
+                "senderId": payload.reply_to.sender.id,
+                "senderName": payload.reply_to.sender.name,
+                "text": payload.reply_to.text,
+                "msgType": payload.reply_to.msg_type,
+                "timestamp": int(payload.reply_to.timestamp.timestamp() * 1000),
+            }
+        if payload.mentions:
+            rpc_params["mentions"] = [
+                {"userId": m.user_id, "pos": m.pos, "len": m.length} for m in payload.mentions
+            ]
+        if payload.styles:
+            rpc_params["styles"] = [
+                {
+                    "start": s.start,
+                    "len": s.length,
+                    "style": s.style.value,
+                    **({"indentSize": s.indent_size} if s.indent_size is not None else {}),
+                }
+                for s in payload.styles
+            ]
+        if payload.urgency is not None:
+            rpc_params["urgency"] = int(payload.urgency)
+        if payload.attachment is not None:
+            rpc_params["attachment"] = _serialize_media_input(payload.attachment)
+        if payload.attachments:
+            rpc_params["attachments"] = [_serialize_media_input(a) for a in payload.attachments]
+
+        res = await self._rpc("sendMessage", rpc_params)
         return SendMessageReceipt(
             message_id=res.get("messageId") if isinstance(res, dict) else None,
             attachment_message_ids=list(res.get("attachmentMessageIds") or [])
@@ -480,13 +658,46 @@ class NodeBridgeTransport(TransportAdapter):
         )
 
     async def get_group_chat_history(
-        self, group_id: str, count: int | None = None
+        self,
+        group_id: str,
+        count: int | None = None,
+        *,
+        cursor: str | None = None,
+        is_old: bool = False,
     ) -> dict[str, Any]:
-        return await self._rpc("getGroupChatHistory", {"groupId": group_id, "count": count}) or {
-            "messages": [],
-            "hasMore": False,
-            "nextCursor": None,
+        params: dict[str, Any] = {
+            "groupId": group_id,
+            "count": count,
+            "cursor": cursor,
+            "isOld": is_old,
         }
+        try:
+            res = await self._rpc("getGroupChatHistory", params)
+        except Exception as err:
+            if _is_stop_paging_error(err):
+                return {
+                    "messages": [],
+                    "hasMore": False,
+                    "nextCursor": None,
+                    "isOld": is_old,
+                }
+            raise
+        if not isinstance(res, dict):
+            return {"messages": [], "hasMore": False, "nextCursor": None, "isOld": is_old}
+        return {
+            "messages": list(res.get("messages") or []),
+            "hasMore": bool(res.get("hasMore")),
+            "nextCursor": res.get("nextCursor"),
+            "isOld": bool(res.get("isOld", is_old)),
+        }
+
+    async def request_old_messages(
+        self, thread_type: ThreadType, last_msg_id: str | None = None
+    ) -> None:
+        await self._rpc(
+            "requestOldMessages",
+            {"threadType": int(thread_type), "lastMsgId": last_msg_id},
+        )
 
     async def undo_message(self, message: Message) -> None:
         await self._rpc(
@@ -536,10 +747,10 @@ class NodeBridgeTransport(TransportAdapter):
     async def upload_attachment(
         self, sources: list[MediaInput], thread_id: str, thread_type: ThreadType
     ) -> list[dict[str, Any]]:
-        paths = [s for s in sources if isinstance(s, str)]
+        serialized = [_serialize_media_input(s) for s in sources]
         return await self._rpc(
             "uploadAttachment",
-            {"sources": paths, "threadId": thread_id, "threadType": int(thread_type)},
+            {"sources": serialized, "threadId": thread_id, "threadType": int(thread_type)},
         ) or []
 
     async def get_account_settings(self) -> dict[str, Any]:
@@ -552,7 +763,17 @@ class NodeBridgeTransport(TransportAdapter):
         self, handlers: dict[str, Callable[[Any], Any]], *, retry_on_close: bool = False
     ) -> None:
         self._handlers.update(handlers)
-        await self._rpc("startListening", {"retryOnClose": retry_on_close})
+        try:
+            await self._rpc("startListening", {"retryOnClose": retry_on_close})
+        except BaseException:
+            for key in _REALTIME_EVENT_KEYS:
+                self._handlers.pop(key, None)
+            raise
 
     async def stop_listening(self) -> None:
-        await self._rpc("stopListening")
+        try:
+            if self._proc is not None and self._proc.returncode is None:
+                await self._rpc("stopListening")
+        finally:
+            for key in _REALTIME_EVENT_KEYS:
+                self._handlers.pop(key, None)

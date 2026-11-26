@@ -361,3 +361,40 @@ async def test_realtime_events_and_multi_account() -> None:
     assert expired == ["session_expired"]
     assert c_b.is_authenticated() is True
     assert c_b.account.get_own_id() == "bot-B"
+
+
+async def test_get_many_cache_validation_and_destroy() -> None:
+    from zapind import RetryOptions, ValidationError
+
+    with pytest.raises(ValidationError):
+        Zapind(timeout=0)
+    with pytest.raises(ValidationError):
+        Zapind(cache_ttl=0)
+    with pytest.raises(ValidationError):
+        Zapind(max_cache_entries=0)
+    with pytest.raises(ValidationError):
+        Zapind(retry=RetryOptions(max_attempts=0))
+
+    transport = MockTransport()
+    client = Zapind(transport=transport, rate_limit=False)
+    await client.login()
+
+    with pytest.raises(ValidationError):
+        await client.contacts.block("   ")
+    with pytest.raises(ValidationError):
+        await client.contacts.list(count=0)
+
+    await client.users.get("u-1")
+    assert transport.user_info_calls == 1
+
+    many = await client.users.get_many(["u-1", "u-1", "u-2"])
+    assert sorted(many.keys()) == ["u-1", "u-2"]
+    assert transport.user_info_calls == 2
+
+    # All cached -> 0 extra network calls
+    await client.users.get_many(["u-1", "u-2"])
+    assert transport.user_info_calls == 2
+
+    await client.start_listening()
+    await client.destroy()
+    assert client.is_authenticated() is False

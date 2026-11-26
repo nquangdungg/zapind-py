@@ -123,12 +123,15 @@ class InFlightDeduplicator:
         self._pending.clear()
 
 
+_MAX_KNOWN_USERS = 10_000
+
+
 class ThreadTypeRegistry:
     """Resolves ThreadType automatically from contextual objects or cached Group IDs."""
 
     def __init__(self, groups_ttl: float = 300.0) -> None:
         self._group_ids: set[str] = set()
-        self._user_ids: set[str] = set()
+        self._user_ids: OrderedDict[str, None] = OrderedDict()
         self._groups_loaded_at: float = 0.0
         self._groups_ttl = groups_ttl
         self._lock = asyncio.Lock()
@@ -136,18 +139,21 @@ class ThreadTypeRegistry:
     def register_group(self, group_id: str) -> None:
         if group_id:
             self._group_ids.add(group_id)
-            self._user_ids.discard(group_id)
+            self._user_ids.pop(group_id, None)
 
     def register_groups(self, ids: Iterable[str]) -> None:
         for gid in ids:
             if gid:
                 self._group_ids.add(gid)
-                self._user_ids.discard(gid)
+                self._user_ids.pop(gid, None)
         self._groups_loaded_at = time.monotonic()
 
     def register_user(self, user_id: str) -> None:
-        if user_id and user_id not in self._group_ids:
-            self._user_ids.add(user_id)
+        if not user_id or user_id in self._group_ids:
+            return
+        if user_id not in self._user_ids and len(self._user_ids) >= _MAX_KNOWN_USERS:
+            self._user_ids.popitem(last=False)
+        self._user_ids[user_id] = None
 
     @staticmethod
     def extract_id(target: ThreadTarget) -> str:
@@ -309,7 +315,9 @@ class PolicyExecutor:
                 )
                 raise normalized from err
 
-        return await with_retry(_attempt, self._retry, allow_retry=idempotent)
+        if not idempotent or self._retry.max_attempts <= 1:
+            return await _attempt()
+        return await with_retry(_attempt, self._retry, allow_retry=True)
 
 
 class EventBus:
@@ -347,8 +355,11 @@ class EventBus:
             self._listeners.pop(event, None)
 
     def emit(self, event: str, payload: Any) -> None:
-        handlers = list(self._listeners.get(event, ()))
-        for handler in handlers:
+        handlers = self._listeners.get(event)
+        if not handlers:
+            return
+        iterable = handlers if len(handlers) == 1 else list(handlers)
+        for handler in iterable:
             try:
                 res = handler(payload)
                 if inspect.isawaitable(res):

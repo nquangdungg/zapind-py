@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zapind"
-version = "0.1.0"
+version = "1.0.0"
 description = "Developer-friendly, async-first, type-safe contextual Zalo SDK for Python."
 readme = "README.md"
 license = { text = "LGPL-3.0-only" }
@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["zalo", "zapind", "zalo-sdk", "zalo-bot", "asyncio", "sdk"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",
   "Programming Language :: Python :: 3",
@@ -54,4 +54,6 @@ include = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["src"]
 testpaths = ["tests"]

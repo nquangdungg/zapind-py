@@ -95,18 +95,18 @@ class _ClientModelActions:
         return await self._client.conversations.get_messages(group_id, count)
 
     async def send_typing(self, thread_id: str, thread_type: ThreadType) -> None:
-        await self._client.conversations.send_typing(Conversation(thread_id, thread_type, self))
+        await self._client.conversations.send_typing(thread_id, thread_type=thread_type)
 
     async def pin_conversation(
         self, thread_id: str, pinned: bool, thread_type: ThreadType
     ) -> None:
-        await self._client.conversations.pin(Conversation(thread_id, thread_type, self), pinned)
+        await self._client.conversations.pin(thread_id, pinned, thread_type=thread_type)
 
     async def mute_conversation(
         self, thread_id: str, duration_seconds: int, thread_type: ThreadType
     ) -> None:
         await self._client.conversations.mute(
-            Conversation(thread_id, thread_type, self), duration_seconds
+            thread_id, duration_seconds, thread_type=thread_type
         )
 
     async def send_friend_request(self, user_id: str, message: str) -> None:
@@ -181,6 +181,17 @@ class Zapind:
             raise ValidationError("timeout must be a positive number")
         if qr_timeout <= 0:
             raise ValidationError("qr_timeout must be a positive number")
+        if cache_ttl <= 0:
+            raise ValidationError("cache_ttl must be a positive number")
+        if max_cache_entries < 1:
+            raise ValidationError("max_cache_entries must be a positive integer")
+        resolved_retry = retry or RetryOptions()
+        if resolved_retry.max_attempts < 1:
+            raise ValidationError("retry.max_attempts must be >= 1")
+        if resolved_retry.base_delay < 0:
+            raise ValidationError("retry.base_delay must be >= 0")
+        if resolved_retry.max_delay < resolved_retry.base_delay:
+            raise ValidationError("retry.max_delay must be >= retry.base_delay")
 
         self._qr_timeout = qr_timeout
         self._self_listen = self_listen
@@ -206,7 +217,7 @@ class Zapind:
 
         self._executor = PolicyExecutor(
             default_timeout=timeout,
-            retry_options=retry or RetryOptions(),
+            retry_options=resolved_retry,
             rate_limiter=limiter,
             logger=self._logger,
         )
@@ -425,6 +436,11 @@ class Zapind:
         self._dedup.clear()
         if clear_session:
             await self._store.clear()
+
+    async def destroy(self, *, clear_session: bool = False) -> None:
+        """Stop listeners, disconnect, clear caches, and remove all registered event listeners."""
+        await self.logout(clear_session=clear_session)
+        self._event_bus.remove_all_listeners()
 
     def on(self, event: str, handler: EventHandler | None = None) -> Any:
         """Register an event listener directly or as a decorator (`@client.on("message")`)."""
